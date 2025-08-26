@@ -1,0 +1,64 @@
+pipeline {
+  agent any
+
+  environment {
+    AWS_CREDENTIALS_ID = 'aws-creds'
+    SSH_CREDENTIALS_ID = 'oneclick-key'
+    GITHUB_CREDENTIALS_ID = 'github-token'
+  }
+
+  stages {
+    stage('Checkout Code') {
+      steps {
+        git credentialsId: env.GITHUB_CREDENTIALS_ID,
+            url: 'https://github.com/ThakurDhani/one-click-infra.git',
+            branch: 'main'
+      }
+    }
+
+    stage('Terraform Init & Apply') {
+      steps {
+        dir('One-click-infra-ES/terraform') {
+          withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: env.AWS_CREDENTIALS_ID]]) {
+            sh 'terraform init'
+            sh 'terraform apply -auto-approve'
+          }
+        }
+      }
+    }
+
+    stage('Configure SSH') {
+      steps {
+        script {
+          def bastion_ip = sh(script: "terraform output -raw bastion_public_ip", returnStdout: true).trim()
+          writeFile file: "${env.WORKSPACE}/ssh_config", text: """
+Host bastion
+  HostName ${bastion_ip}
+  User ubuntu
+  IdentityFile ~/.ssh/oneclick.pem
+  StrictHostKeyChecking no
+
+Host private-ec2-*
+  User ubuntu
+  IdentityFile ~/.ssh/oneclick.pem
+  ProxyJump bastion
+  StrictHostKeyChecking no
+"""
+        }
+      }
+    }
+
+    stage('Run Ansible Playbook') {
+      steps {
+        dir('One-click-infra-ES/ansible') {
+          withCredentials([sshUserPrivateKey(credentialsId: env.SSH_CREDENTIALS_ID, keyFileVariable: 'SSH_KEY')]) {
+            sh '''
+              export ANSIBLE_HOST_KEY_CHECKING=False
+              ansible-playbook -i inventory/aws_ec2.yml playbook.yml --private-key $SSH_KEY
+            '''
+          }
+        }
+      }
+    }
+  }
+}
