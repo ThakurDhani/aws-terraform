@@ -1,0 +1,111 @@
+pipeline {
+    agent any
+
+    environment {
+        AWS_REGION = 'ap-south-1'
+    }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        timeout(time: 45, unit: 'MINUTES')
+    }
+
+    stages {
+        stage('Checkout Code') {
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'github-token', usernameVariable: 'GITHUB_USER', passwordVariable: 'GITHUB_TOKEN')]) {
+                    sh 'rm -rf one-click-infra || true'
+                    sh "git clone https://${GITHUB_USER}:${GITHUB_TOKEN}@github.com/ThakurDhani/one-click-infra.git"
+                }
+            }
+        }
+
+        stage('Terraform Init & Apply') {
+            steps {
+                dir('one-click-infra/One-click-infra-ES/terraform') {
+                    withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-creds']]) {
+                        sh '''
+                            terraform init
+                            terraform apply -auto-approve
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Wait for Bastion & ASG Instances') {
+            steps {
+                echo "⏳ Waiting 180 seconds for Bastion and EC2s to be ready..."
+                sleep 180
+            }
+        }
+
+        stage('Configure SSH via Bastion') {
+            steps {
+                dir('one-click-infra/One-click-infra-ES/terraform') {
+                    withCredentials([
+                        sshUserPrivateKey(credentialsId: 'oneclick-key', keyFileVariable: 'SSH_KEY_PATH'),
+                        [$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-creds']
+                    ]) {
+                        script {
+                            def bastionIP = sh(script: "terraform output -raw bastion_public_ip", returnStdout: true).trim()
+
+                            writeFile file: "${WORKSPACE}/.ssh_config", text: """
+Host bastion
+  HostName ${bastionIP}
+  User ubuntu
+  IdentityFile ${SSH_KEY_PATH}
+  StrictHostKeyChecking no
+
+Host asg-*
+  User ubuntu
+  ProxyJump bastion
+  IdentityFile ${SSH_KEY_PATH}
+  StrictHostKeyChecking no
+
+Host *.compute.internal
+  User ubuntu
+  ProxyJump bastion
+  IdentityFile ${SSH_KEY_PATH}
+  StrictHostKeyChecking no
+"""
+
+                            sh "chmod 600 ${WORKSPACE}/.ssh_config"
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Run Ansible Playbook') {
+            steps {
+                dir('one-click-infra/One-click-infra-ES/ansible') {
+                    withCredentials([
+                        sshUserPrivateKey(credentialsId: 'oneclick-key', keyFileVariable: 'SSH_KEY_PATH'),
+                        [$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-creds']
+                    ]) {
+                        sh '''
+                            export ANSIBLE_HOST_KEY_CHECKING=False
+                            ansible-playbook -i inventory/aws_ec2.yml playbook.yml \
+                                --private-key $SSH_KEY_PATH \
+                                --ssh-extra-args "-F ${WORKSPACE}/.ssh_config"
+                        '''
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            echo '🧹 Cleaning workspace...'
+            cleanWs()
+        }
+        success {
+            echo '✅ Pipeline completed successfully!'
+        }
+        failure {
+            echo '❌ Pipeline failed. Check the logs for details.'
+        }
+    }
+}
